@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>IFC Link Viewer</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#1e2227;color:#eee}
+  #bar{position:fixed;top:0;left:0;right:0;z-index:2;display:flex;gap:6px;padding:8px;background:rgba(20,22,26,.92);flex-wrap:wrap}
+  #bar input[type=text]{flex:1;min-width:180px;padding:9px;border-radius:6px;border:1px solid #444;background:#2a2f36;color:#eee;font-size:14px}
+  #bar button,#bar label{padding:9px 12px;border-radius:6px;border:0;background:#0f6cbd;color:#fff;font-size:14px;cursor:pointer}
+  #bar label{background:#3a414b}
+  #file{display:none}
+  #status{position:fixed;bottom:0;left:0;right:0;z-index:2;padding:8px 10px;font-size:13px;background:rgba(20,22,26,.85)}
+  canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<div id="bar">
+  <input id="url" type="text" placeholder="Paste Dropbox link (dl=0 is fine)">
+  <button id="load">Load</button>
+  <label for="file">Open file</label><input id="file" type="file" accept=".ifc">
+  <button id="fit">Fit</button>
+</div>
+<div id="status">Paste a Dropbox IFC link, or open a file from your phone.</div>
+
+<script>
+  // Show any error on screen instead of failing silently
+  window.addEventListener("error", e => { document.getElementById("status").textContent = "Error: " + (e.message || e); });
+  window.addEventListener("unhandledrejection", e => { document.getElementById("status").textContent = "Error: " + (e.reason && e.reason.message || e.reason); });
+  if (location.protocol === "file:" ) document.getElementById("status").textContent = "Opened as a local file — if Load does nothing, host it (Netlify Drop / GitHub Pages) or run a local server.";
+</script>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "web-ifc": "https://cdn.jsdelivr.net/npm/web-ifc@0.0.66/web-ifc-api.js"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import * as WebIFC from "web-ifc";
+
+const statusEl = document.getElementById("status");
+const setStatus = t => statusEl.textContent = t;
+
+// ---------- three.js scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1e2227);
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 5000);
+camera.position.set(30, 30, 30);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0); dir.position.set(50, 100, 30); scene.add(dir);
+const modelGroup = new THREE.Group(); scene.add(modelGroup);
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+(function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+function fit() {
+  const box = new THREE.Box3().setFromObject(modelGroup);
+  if (box.isEmpty()) return;
+  const c = box.getCenter(new THREE.Vector3()), s = box.getSize(new THREE.Vector3()).length();
+  controls.target.copy(c);
+  camera.position.copy(c).add(new THREE.Vector3(s * 0.6, s * 0.5, s * 0.6));
+  camera.near = s / 1000; camera.far = s * 10; camera.updateProjectionMatrix();
+}
+document.getElementById("fit").onclick = fit;
+
+// ---------- web-ifc ----------
+const ifcApi = new WebIFC.IfcAPI();
+ifcApi.SetWasmPath("https://cdn.jsdelivr.net/npm/web-ifc@0.0.66/", true);
+const ready = ifcApi.Init().then(() => setStatus("Viewer ready. Paste a link and tap Load, or Open file."));
+
+function toDirectDropbox(u) {
+  u = u.trim();
+  if (!u.includes("dropbox.com")) return u;
+  const url = new URL(u);
+  url.hostname = "dl.dropboxusercontent.com";
+  url.searchParams.delete("st");
+  url.searchParams.set("dl", "1");
+  return url.toString();
+}
+
+async function loadBytes(bytes) {
+  await ready;
+  modelGroup.clear();
+  setStatus("Parsing IFC…");
+  await new Promise(r => setTimeout(r, 30));
+  const modelID = ifcApi.OpenModel(bytes, { COORDINATE_TO_ORIGIN: true });
+
+  // Merge geometry by colour → few draw calls (important on phones)
+  const buckets = new Map();
+  const m = new THREE.Matrix4(), v = new THREE.Vector3(), n = new THREE.Vector3(), nm = new THREE.Matrix3();
+  let count = 0;
+  ifcApi.StreamAllMeshes(modelID, mesh => {
+    const pgs = mesh.geometries;
+    for (let i = 0; i < pgs.size(); i++) {
+      const pg = pgs.get(i);
+      const g = ifcApi.GetGeometry(modelID, pg.geometryExpressID);
+      const verts = ifcApi.GetVertexArray(g.GetVertexData(), g.GetVertexDataSize());
+      const idx = ifcApi.GetIndexArray(g.GetIndexData(), g.GetIndexDataSize());
+      const c = pg.color;
+      const key = `${c.x.toFixed(3)}_${c.y.toFixed(3)}_${c.z.toFixed(3)}_${c.w.toFixed(2)}`;
+      let b = buckets.get(key);
+      if (!b) { b = { pos: [], nor: [], idx: [], color: c }; buckets.set(key, b); }
+      m.fromArray(pg.flatTransformation); nm.getNormalMatrix(m);
+      const base = b.pos.length / 3;
+      for (let k = 0; k < verts.length; k += 6) {
+        v.set(verts[k], verts[k+1], verts[k+2]).applyMatrix4(m);
+        n.set(verts[k+3], verts[k+4], verts[k+5]).applyMatrix3(nm).normalize();
+        b.pos.push(v.x, v.y, v.z); b.nor.push(n.x, n.y, n.z);
+      }
+      for (let k = 0; k < idx.length; k++) b.idx.push(idx[k] + base);
+      g.delete();
+    }
+    if (++count % 500 === 0) setStatus(`Building geometry… ${count} elements`);
+  });
+
+  for (const b of buckets.values()) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
+    geo.setAttribute("normal", new THREE.Float32BufferAttribute(b.nor, 3));
+    geo.setIndex(b.pos.length / 3 > 65535 ? new THREE.Uint32BufferAttribute(b.idx, 1) : new THREE.Uint16BufferAttribute(b.idx, 1));
+    const mat = new THREE.MeshLambertMaterial({
+      color: new THREE.Color(b.color.x, b.color.y, b.color.z),
+      transparent: b.color.w < 1, opacity: b.color.w, side: THREE.DoubleSide,
+      depthWrite: b.color.w >= 1
+    });
+    modelGroup.add(new THREE.Mesh(geo, mat));
+  }
+  ifcApi.CloseModel(modelID);
+  fit();
+  setStatus(`Loaded ${count} elements. Drag to orbit, pinch to zoom, two-finger drag to pan.`);
+}
+
+async function loadUrl(raw) {
+  const direct = toDirectDropbox(raw);
+  setStatus("Connecting to " + new URL(direct).hostname + "…");
+  try {
+    const res = await fetch(direct);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const total = +res.headers.get("content-length") || 0;
+    const reader = res.body.getReader(); const chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      chunks.push(value); got += value.length;
+      setStatus(`Downloading… ${(got/1048576).toFixed(1)} MB${total ? " / " + (total/1048576).toFixed(1) + " MB" : ""}`);
+    }
+    const bytes = new Uint8Array(got); let o = 0;
+    for (const c of chunks) { bytes.set(c, o); o += c.length; }
+    await loadBytes(bytes);
+  } catch (e) {
+    setStatus(`Could not load link: ${e.message}. "Failed to fetch" = blocked by Dropbox (CORS) or network/firewall. Use "Open file" instead.`);
+  }
+}
+
+document.getElementById("load").onclick = () => {
+  const u = document.getElementById("url").value;
+  if (!u) { setStatus("Paste a link first."); return; }
+  history.replaceState(null, "", "?url=" + encodeURIComponent(u));
+  loadUrl(u);
+};
+document.getElementById("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  setStatus(`Reading ${f.name}…`);
+  await loadBytes(new Uint8Array(await f.arrayBuffer()));
+};
+
+// Auto-load from ?url=
+const qp = new URLSearchParams(location.search).get("url");
+if (qp) { document.getElementById("url").value = qp; loadUrl(qp); }
+</script>
+</body>
+</html>
